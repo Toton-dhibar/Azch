@@ -25,6 +25,8 @@ IMAGE_SHA256=""
 OS_DISK=""
 OS_NAME=""
 FALLBACK_MODE=0
+EFI_PART=""
+ROOT_PART=""
 
 # Initialize logging
 exec > >(tee -a "$LOGFILE") 2>&1
@@ -101,7 +103,7 @@ detect_os_disk() {
     if [[ $disk_size -lt $min_size_bytes ]]; then
         log "WARNING: Disk size seems small for an OS disk"
         read -p "Continue anyway? (yes/no): " confirm
-        [[ $confirm != "yes" ]] && error "Aborted by user"
+        [[ "$confirm" != "yes" ]] && error "Aborted by user"
     fi
 }
 
@@ -196,6 +198,8 @@ download_image() {
     local url=$1
     local sha256=$2
     
+    [[ -z "$url" ]] && error "Image URL not provided"
+    
     log "Downloading image from: $url"
     mkdir -p "$DOWNLOAD_DIR"
     
@@ -216,7 +220,7 @@ download_image() {
         log "Verifying SHA256 checksum..."
         local actual_sha256=$(sha256sum "$IMAGE_FILE" | awk '{print $1}')
         
-        if [[ ${actual_sha256,,} != ${sha256,,} ]]; then
+        if [[ ${actual_sha256,,} != "${sha256,,}" ]]; then
             error "SHA256 mismatch! Expected: $sha256, Got: $actual_sha256"
         fi
         
@@ -228,6 +232,8 @@ download_image() {
 
 extract_image() {
     log "Extracting/converting image..."
+    
+    [[ ! -f "$IMAGE_FILE" ]] && error "Image file not found: $IMAGE_FILE"
     
     local src_image="$IMAGE_FILE"
     local raw_image="$DOWNLOAD_DIR/disk.raw"
@@ -250,7 +256,7 @@ partition_disk() {
     
     # Unmount any existing partitions on the target disk
     for part in ${OS_DISK}*; do
-        if [[ $part != $OS_DISK ]]; then
+        if [[ "$part" != "$OS_DISK" ]]; then
             umount -f "$part" 2>/dev/null || true
         fi
     done
@@ -274,7 +280,6 @@ partition_disk() {
     
     # Inform kernel of partition changes
     partprobe "$OS_DISK" 2>/dev/null || true
-    sleep 3
     
     # Determine partition naming scheme
     if [[ $OS_DISK =~ nvme ]]; then
@@ -287,18 +292,32 @@ partition_disk() {
     
     log "Partitions created: EFI=$EFI_PART, ROOT=$ROOT_PART"
     
-    # Wait for devices to appear
-    for i in {1..10}; do
-        [[ -b $EFI_PART ]] && [[ -b $ROOT_PART ]] && break
+    # Wait for devices to appear with better timing logic
+    local max_wait=30
+    local waited=0
+    while [[ $waited -lt $max_wait ]]; do
+        if [[ -b "$EFI_PART" ]] && [[ -b "$ROOT_PART" ]]; then
+            log "Partition devices ready after ${waited} seconds"
+            break
+        fi
         sleep 1
+        waited=$((waited + 1))
+        # Re-probe every 5 seconds for slower systems
+        if [[ $((waited % 5)) -eq 0 ]]; then
+            partprobe "$OS_DISK" 2>/dev/null || true
+        fi
     done
     
-    [[ ! -b $EFI_PART ]] && error "EFI partition device not found: $EFI_PART"
-    [[ ! -b $ROOT_PART ]] && error "Root partition device not found: $ROOT_PART"
+    [[ ! -b "$EFI_PART" ]] && error "EFI partition device not found: $EFI_PART"
+    [[ ! -b "$ROOT_PART" ]] && error "Root partition device not found: $ROOT_PART"
 }
 
 format_partitions() {
     log "Formatting partitions..."
+    
+    # Validate partition devices exist
+    [[ ! -b "$EFI_PART" ]] && error "EFI partition device not found: $EFI_PART"
+    [[ ! -b "$ROOT_PART" ]] && error "Root partition device not found: $ROOT_PART"
     
     # Format EFI partition
     log "Formatting EFI partition as FAT32..."
@@ -399,6 +418,11 @@ mount_image_loop() {
 
 copy_rootfs() {
     log "Copying root filesystem..."
+    
+    # Validate partition devices exist
+    [[ ! -b "$ROOT_PART" ]] && error "Root partition device not found: $ROOT_PART"
+    [[ ! -b "$EFI_PART" ]] && error "EFI partition device not found: $EFI_PART"
+    [[ ! -f "$IMAGE_FILE" ]] && error "Image file not found: $IMAGE_FILE"
     
     # Mount target partitions
     mkdir -p "$MOUNT_DIR" "$EFI_MOUNT"
@@ -563,20 +587,28 @@ EOF
 install_bootloader() {
     log "Installing bootloader..."
     
+    # Validate required paths and devices
+    [[ ! -d "$MOUNT_DIR" ]] && error "Mount directory not found: $MOUNT_DIR"
+    [[ ! -b "$EFI_PART" ]] && error "EFI partition device not found: $EFI_PART"
+    [[ ! -b "$ROOT_PART" ]] && error "Root partition device not found: $ROOT_PART"
+    
     # Prepare chroot environment
-    mount --bind /dev "$MOUNT_DIR/dev"
-    mount --bind /dev/pts "$MOUNT_DIR/dev/pts"
-    mount --bind /proc "$MOUNT_DIR/proc"
-    mount --bind /sys "$MOUNT_DIR/sys"
+    mount --bind /dev "$MOUNT_DIR/dev" || error "Failed to bind mount /dev"
+    mount --bind /dev/pts "$MOUNT_DIR/dev/pts" || log "WARNING: Failed to bind mount /dev/pts"
+    mount --bind /proc "$MOUNT_DIR/proc" || error "Failed to bind mount /proc"
+    mount --bind /sys "$MOUNT_DIR/sys" || error "Failed to bind mount /sys"
     
     # Mount EFI partition inside chroot
     mkdir -p "$MOUNT_DIR/boot/efi"
-    mount "$EFI_PART" "$MOUNT_DIR/boot/efi"
+    mount "$EFI_PART" "$MOUNT_DIR/boot/efi" || error "Failed to mount EFI partition in chroot"
     
     # Create fstab
     log "Creating fstab..."
     local root_uuid=$(blkid -s UUID -o value "$ROOT_PART")
     local efi_uuid=$(blkid -s UUID -o value "$EFI_PART")
+    
+    [[ -z "$root_uuid" ]] && error "Failed to get UUID for root partition"
+    [[ -z "$efi_uuid" ]] && error "Failed to get UUID for EFI partition"
     
     cat > "$MOUNT_DIR/etc/fstab" <<EOF
 # /etc/fstab: static file system information.
@@ -626,18 +658,42 @@ EOF
 cleanup() {
     log "Cleaning up..."
     
-    # Unmount everything
-    umount "$SRC_MOUNT" 2>/dev/null || true
-    umount "$EFI_MOUNT" 2>/dev/null || true
-    umount "$MOUNT_DIR" 2>/dev/null || true
+    # Unmount chroot bind mounts if they exist
+    if [[ -d "$MOUNT_DIR" ]]; then
+        umount "$MOUNT_DIR/boot/efi" 2>/dev/null || true
+        umount "$MOUNT_DIR/sys" 2>/dev/null || true
+        umount "$MOUNT_DIR/proc" 2>/dev/null || true
+        umount "$MOUNT_DIR/dev/pts" 2>/dev/null || true
+        umount "$MOUNT_DIR/dev" 2>/dev/null || true
+    fi
+    
+    # Unmount main mount points
+    [[ -d "$SRC_MOUNT" ]] && umount "$SRC_MOUNT" 2>/dev/null || true
+    [[ -d "$EFI_MOUNT" ]] && umount "$EFI_MOUNT" 2>/dev/null || true
+    [[ -d "$MOUNT_DIR" ]] && umount "$MOUNT_DIR" 2>/dev/null || true
+    
+    # Cleanup loop devices via kpartx
+    if command -v kpartx &>/dev/null; then
+        for loop in /dev/loop*; do
+            if [[ -b "$loop" ]] && losetup "$loop" 2>/dev/null | grep -q "$DOWNLOAD_DIR"; then
+                log "Cleaning up loop device: $loop"
+                kpartx -d "$loop" 2>/dev/null || true
+                losetup -d "$loop" 2>/dev/null || true
+            fi
+        done
+    fi
     
     # Disconnect NBD devices
-    for nbd in /dev/nbd*; do
-        [[ -b $nbd ]] && qemu-nbd -d "$nbd" 2>/dev/null || true
-    done
+    if command -v qemu-nbd &>/dev/null; then
+        for nbd in /dev/nbd*; do
+            if [[ -b "$nbd" ]]; then
+                qemu-nbd -d "$nbd" 2>/dev/null || true
+            fi
+        done
+    fi
     
     # Remove temporary directories (keep backup and log)
-    rm -rf "$DOWNLOAD_DIR"
+    [[ -d "$DOWNLOAD_DIR" ]] && rm -rf "$DOWNLOAD_DIR"
     
     log "Cleanup completed. Backup preserved at: $BACKUP_DIR"
 }
@@ -750,7 +806,7 @@ EOF
     
     read -p "Type 'YES' in capital letters to proceed: " confirm
     
-    if [[ $confirm != "YES" ]]; then
+    if [[ "$confirm" != "YES" ]]; then
         log "Installation cancelled by user"
         exit 0
     fi
@@ -808,7 +864,7 @@ main() {
     # Show menu and get selection
     local choice=$(show_menu)
     
-    if [[ $choice == "0" ]]; then
+    if [[ "$choice" == "0" ]]; then
         log "Exiting..."
         exit 0
     fi
@@ -875,7 +931,7 @@ main() {
     
     read -p "Reboot now? (yes/no): " reboot_now
     
-    if [[ $reboot_now == "yes" ]]; then
+    if [[ "$reboot_now" == "yes" ]]; then
         log "Rebooting in 5 seconds..."
         sleep 5
         reboot
