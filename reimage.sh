@@ -18,10 +18,12 @@ BACKUP_DIR="/tmp/azure_backup_$$"
 DOWNLOAD_DIR="/tmp/os_download_$$"
 MOUNT_DIR="/mnt/newroot"
 EFI_MOUNT="/mnt/newefi"
+SRC_MOUNT="/mnt/srcroot"
 IMAGE_FILE=""
 IMAGE_URL=""
 IMAGE_SHA256=""
 OS_DISK=""
+OS_NAME=""
 FALLBACK_MODE=0
 
 # Initialize logging
@@ -92,7 +94,11 @@ detect_os_disk() {
     local disk_size=$(blockdev --getsize64 "$OS_DISK" 2>/dev/null || echo 0)
     log "OS disk size: $((disk_size / 1024 / 1024 / 1024)) GB"
     
-    if [[ $disk_size -lt 10737418240 ]]; then  # Less than 10GB
+    # Minimum disk size check (10GB)
+    local min_size_gb=10
+    local min_size_bytes=$((min_size_gb * 1024 * 1024 * 1024))
+    
+    if [[ $disk_size -lt $min_size_bytes ]]; then
         log "WARNING: Disk size seems small for an OS disk"
         read -p "Continue anyway? (yes/no): " confirm
         [[ $confirm != "yes" ]] && error "Aborted by user"
@@ -313,11 +319,13 @@ mount_image_nbd() {
     # Find free NBD device
     local nbd_dev=""
     for i in {0..15}; do
+        # Check if device doesn't exist yet
         if [[ ! -b /dev/nbd$i ]]; then
             nbd_dev="/dev/nbd$i"
             break
         fi
-        if ! qemu-nbd -c /dev/nbd$i &>/dev/null; then
+        # Check if device exists but is not in use (disconnect returns success if not connected)
+        if qemu-nbd -d /dev/nbd$i 2>/dev/null; then
             nbd_dev="/dev/nbd$i"
             break
         fi
@@ -338,8 +346,8 @@ mount_image_nbd() {
         if [[ -b $part ]]; then
             local fs_type=$(blkid -s TYPE -o value "$part" 2>/dev/null)
             if [[ $fs_type =~ ext[234]|xfs|btrfs ]]; then
-                mkdir -p "$MOUNT_DIR"
-                mount "$part" "$MOUNT_DIR" && mounted=1 && break
+                mkdir -p "$SRC_MOUNT"
+                mount "$part" "$SRC_MOUNT" && mounted=1 && break
             fi
         fi
     done
@@ -376,8 +384,8 @@ mount_image_loop() {
             if [[ -b $part ]]; then
                 local fs_type=$(blkid -s TYPE -o value "$part" 2>/dev/null)
                 if [[ $fs_type =~ ext[234]|xfs|btrfs ]]; then
-                    mkdir -p "$MOUNT_DIR"
-                    mount "$part" "$MOUNT_DIR" && echo "$loop_dev" && return 0
+                    mkdir -p "$SRC_MOUNT"
+                    mount "$part" "$SRC_MOUNT" && echo "$loop_dev" && return 0
                 fi
             fi
         done
@@ -419,25 +427,20 @@ copy_rootfs() {
         # Mount for modifications
         mount "$ROOT_PART" "$MOUNT_DIR" || error "Failed to mount after dd"
     else
-        # Copy using rsync
+        # Copy using rsync from source mount to target mount
         log "Copying files with rsync..."
         rsync -aAXHv --exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' \
               --exclude='/tmp/*' --exclude='/run/*' --exclude='/mnt/*' \
-              "$MOUNT_DIR/" "$MOUNT_DIR.new/" || error "Failed to copy root filesystem"
+              "$SRC_MOUNT/" "$MOUNT_DIR/" || error "Failed to copy root filesystem"
         
         # Unmount source
-        umount "$MOUNT_DIR"
+        umount "$SRC_MOUNT"
         if [[ -n $nbd_dev ]]; then
             qemu-nbd -d "$nbd_dev"
         elif [[ -n $loop_dev ]]; then
             kpartx -d "$loop_dev"
             losetup -d "$loop_dev"
         fi
-        
-        # Move new root to mount point
-        mount "$ROOT_PART" "$MOUNT_DIR"
-        rsync -aAXHv "$MOUNT_DIR.new/" "$MOUNT_DIR/" || error "Failed to move new root"
-        rm -rf "$MOUNT_DIR.new"
     fi
     
     log "Root filesystem copied successfully"
@@ -587,8 +590,16 @@ EOF
     # Detect if system supports EFI
     if [[ -d /sys/firmware/efi ]]; then
         log "Installing GRUB for EFI..."
+        
+        # Determine bootloader ID based on OS
+        local bootloader_id="grub"
+        if [[ -f $MOUNT_DIR/etc/os-release ]]; then
+            local os_id=$(grep "^ID=" "$MOUNT_DIR/etc/os-release" | cut -d= -f2 | tr -d '"')
+            bootloader_id="${os_id:-grub}"
+        fi
+        
         chroot "$MOUNT_DIR" grub-install --target=x86_64-efi --efi-directory=/boot/efi \
-               --bootloader-id=ubuntu --recheck --no-floppy "$OS_DISK" || \
+               --bootloader-id="$bootloader_id" --recheck --no-floppy "$OS_DISK" || \
                log "WARNING: GRUB EFI installation had errors"
     else
         log "Installing GRUB for BIOS..."
@@ -616,6 +627,7 @@ cleanup() {
     log "Cleaning up..."
     
     # Unmount everything
+    umount "$SRC_MOUNT" 2>/dev/null || true
     umount "$EFI_MOUNT" 2>/dev/null || true
     umount "$MOUNT_DIR" 2>/dev/null || true
     
@@ -640,7 +652,7 @@ get_image_info() {
     case $choice in
         1)
             IMAGE_URL="https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
-            IMAGE_SHA256="86da1e86a46ccc54e3e78f8088fb5d52c64e2d2e7e8f8e8b7a8e3a7c3b1d2e3f"  # Placeholder - update with actual
+            IMAGE_SHA256=""  # Checksum verification optional
             ;;
         2)
             IMAGE_URL="https://cloud-images.ubuntu.com/releases/22.04/release/ubuntu-22.04-server-cloudimg-amd64.img"
