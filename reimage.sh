@@ -295,9 +295,11 @@ partition_disk() {
     # Wait for devices to appear with better timing logic
     local max_wait=30
     local waited=0
+    local devices_ready=0
     while [[ $waited -lt $max_wait ]]; do
         if [[ -b "$EFI_PART" ]] && [[ -b "$ROOT_PART" ]]; then
             log "Partition devices ready after ${waited} seconds"
+            devices_ready=1
             break
         fi
         sleep 1
@@ -307,6 +309,11 @@ partition_disk() {
             partprobe "$OS_DISK" 2>/dev/null || true
         fi
     done
+    
+    # Check if we timed out
+    if [[ $devices_ready -eq 0 ]]; then
+        error "Timeout waiting for partition devices to appear after ${max_wait} seconds"
+    fi
     
     [[ ! -b "$EFI_PART" ]] && error "EFI partition device not found: $EFI_PART"
     [[ ! -b "$ROOT_PART" ]] && error "Root partition device not found: $ROOT_PART"
@@ -674,6 +681,7 @@ cleanup() {
     
     # Cleanup loop devices via kpartx
     if command -v kpartx &>/dev/null; then
+        shopt -s nullglob  # Prevent wildcard expansion if no matches
         for loop in /dev/loop*; do
             if [[ -b "$loop" ]] && losetup "$loop" 2>/dev/null | grep -q "$DOWNLOAD_DIR"; then
                 log "Cleaning up loop device: $loop"
@@ -681,15 +689,18 @@ cleanup() {
                 losetup -d "$loop" 2>/dev/null || true
             fi
         done
+        shopt -u nullglob
     fi
     
     # Disconnect NBD devices
     if command -v qemu-nbd &>/dev/null; then
+        shopt -s nullglob  # Prevent wildcard expansion if no matches
         for nbd in /dev/nbd*; do
             if [[ -b "$nbd" ]]; then
                 qemu-nbd -d "$nbd" 2>/dev/null || true
             fi
         done
+        shopt -u nullglob
     fi
     
     # Remove temporary directories (keep backup and log)
